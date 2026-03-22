@@ -100,14 +100,35 @@ OB_WEIGHT_PROC_COUNT    = 0.10  # more statements = more value in ingest
 @dataclass
 class FieldInventory:
     """Fields created, renamed, removed, enriched by a pipeline."""
-    created:   List[str] = field(default_factory=list)   # set/add_field
-    renamed:   List[Tuple[str, str]] = field(default_factory=list)  # (src, dst)
+    created:   List[str] = field(default_factory=list)
+    renamed:   List[Tuple[str, str]] = field(default_factory=list)
     removed:   List[str] = field(default_factory=list)
-    enriched:  List[str] = field(default_factory=list)   # geoip/useragent targets
-    timestamp_source: Optional[str] = None               # date processor source
+    enriched:  List[str] = field(default_factory=list)
+    timestamp_source: Optional[str] = None
     timestamp_target: str = "@timestamp"
-    grok_targets: List[str] = field(default_factory=list) # named capture fields
+    grok_targets: List[str] = field(default_factory=list)
     kv_target:    Optional[str] = None
+
+
+@dataclass
+class ExternalDependency:
+    """A file, service, or resource the pipeline depends on outside of ES/Logstash."""
+    dep_type:    str
+    path:        str
+    plugin:      str
+    note:        str
+
+
+@dataclass
+class PipelineMetadata:
+    """Optional business/operational context supplied via metadata.yml sidecar."""
+    owner:       str = ""
+    team:        str = ""
+    customer:    str = ""
+    environment: str = ""
+    criticality: str = ""
+    volume:      str = ""
+    notes:       str = ""
 
 
 @dataclass
@@ -119,22 +140,55 @@ class Blocker:
 
 
 @dataclass
+class PipelinePattern:
+    """
+    Workshop-oriented pipeline classification.
+
+    primary    : one canonical label (e.g. "jdbc_polling", "heavy_grok")
+    tags       : all additional traits — any number, not mutually exclusive
+    portability: 0–100 (higher = easier to migrate / replace Logstash)
+    coupling   : 0–100 (higher = more external dependencies)
+    complexity : "Low" | "Medium" | "High"
+    """
+    primary:     str
+    tags:        List[str]
+    portability: int
+    coupling:    int
+    complexity:  str
+
+
+@dataclass
+class AntiPatternFlag:
+    """A detected anti-pattern on a specific pipeline."""
+    anti_pattern_id:   str   # machine-readable key
+    name:              str   # short display name
+    severity:          str   # "high" | "medium" | "low" | "info"
+    description:       str   # what was found
+    recommendation:    str   # what to do about it
+
+
+@dataclass
 class PipelineAdvice:
     pipeline_id:        str
-    wave:               int            # 1, 2, or 3
+    wave:               int
     wave_reason:        str
-    operational_benefit: int           # 0-100
+    operational_benefit: int
     benefit_breakdown:  Dict[str, float]
-    migration_effort:   str            # "Low" | "Medium" | "High"
-    effort_score:       int            # 0-100 (higher = more effort)
-    decision:           str            # "Migrate now" | "Partially migrate" | "Redesign first" | "Keep on Logstash"
+    migration_effort:   str
+    effort_score:       int
+    decision:           str
     blockers:           List[Blocker]
     field_inventory:    FieldInventory
-    cluster_id:         Optional[str]  # which pattern cluster this belongs to
-    cluster_template:   bool           # is this the representative of its cluster?
-    processor_fingerprint: str         # canonical processor sequence string
-    is_pure_transformer: bool          # input→filter→ES only, no orchestration
-    is_orchestrator:     bool          # JDBC/multi-output/stateful/routing-heavy
+    external_deps:      List[ExternalDependency]
+    metadata:           PipelineMetadata
+    architecture:       Dict[str, Any]
+    cluster_id:         Optional[str]
+    cluster_template:   bool
+    processor_fingerprint: str
+    is_pure_transformer: bool
+    is_orchestrator:     bool
+    pattern:            Optional[PipelinePattern] = None   # NEW
+    anti_patterns:      List[AntiPatternFlag] = field(default_factory=list)  # NEW
 
 
 @dataclass
@@ -142,11 +196,11 @@ class PatternCluster:
     cluster_id:     str
     fingerprint:    str
     pipeline_ids:   List[str]
-    representative: str          # the pipeline to use as migration template
+    representative: str
     size:           int
     avg_benefit:    float
     avg_fts:        float
-    description:    str          # human-readable cluster description
+    description:    str
 
 
 @dataclass
@@ -158,13 +212,11 @@ class MigrationPlan:
     clusters:           List[PatternCluster]
     pipelines:          List[PipelineAdvice]
     summary_text:       str
-    # ── Cross-pipeline aggregate inventories (new) ──
     all_inputs:         List[Dict[str, Any]] = field(default_factory=list)
-    # [{type, label, pipeline_count, pipelines}]
     all_outputs:        List[Dict[str, Any]] = field(default_factory=list)
-    # [{type, label, pipeline_count, pipelines}]
     all_fields:         Dict[str, Any] = field(default_factory=dict)
-    # {created, renamed, removed, grok_captures, enriched, timestamp_fields}
+    pattern_summary:    List[Dict[str, Any]] = field(default_factory=list)  # NEW
+    anti_pattern_summary: List[Dict[str, Any]] = field(default_factory=list)  # NEW
 
 # ─────────────────────────────────────────────────────────────
 # Helper: flatten the processor tree
@@ -1009,10 +1061,912 @@ def build_global_field_inventory(advices: List[PipelineAdvice]) -> Dict[str, Any
 
 
 # ─────────────────────────────────────────────────────────────
+# 9b. External dependency extraction  (new)
+# ─────────────────────────────────────────────────────────────
+
+def extract_external_deps(row: Dict[str, Any]) -> List[ExternalDependency]:
+    """
+    Scan processor configs for files, DBs, and services the pipeline
+    depends on outside of Elasticsearch / Logstash itself.
+
+    Detects:
+      translate  → dictionary_path (.yml/.csv dict file)
+      ruby       → path (external .rb script)
+      jdbc input → jdbc_connection_string, jdbc_driver_class, statement (SQL)
+      grok       → patterns_dir (custom pattern directory)
+      http input → url (external HTTP endpoint)
+      http filter → url (outbound HTTP call)
+    """
+    deps: List[ExternalDependency] = []
+    sources = row.get("input_sources", []) or []
+    tree    = row.get("processors_ordered", {})
+
+    # ── Input-level deps ──────────────────────────────────
+    for src in sources:
+        sl = src.lower()
+        # JDBC connection string is in the raw input text, not the processor tree
+        raw_in = row.get("raw_input_text", "") or ""
+        if "jdbc" in sl:
+            # Extract connection string if visible in raw text
+            m = re.search(r'jdbc_connection_string\s*=>\s*["\']([^"\']+)', raw_in)
+            conn = m.group(1) if m else "(see config)"
+            deps.append(ExternalDependency(
+                dep_type="jdbc_db", path=conn, plugin="jdbc",
+                note="JDBC database connection — must be replaced with a connector or pre-ingestion job"))
+            # Extract SQL statement file if referenced
+            m2 = re.search(r'statement_filepath\s*=>\s*["\']([^"\']+)', raw_in)
+            if m2:
+                deps.append(ExternalDependency(
+                    dep_type="sql_file", path=m2.group(1), plugin="jdbc",
+                    note="External SQL statement file — must be ported to connector query config"))
+        if "http_poller" in sl:
+            m = re.search(r'url[s]?\s*=>\s*\{[^}]*["\']([^"\']+http[^"\']+)["\']', raw_in, re.IGNORECASE)
+            url = m.group(1) if m else "(see config)"
+            deps.append(ExternalDependency(
+                dep_type="http_endpoint", path=url, plugin="http_poller",
+                note="HTTP polling endpoint — evaluate Elastic Agent HTTP input for replacement"))
+
+    # ── Processor-level deps ──────────────────────────────
+    def walk(n: Dict[str, Any]) -> None:
+        nt = n.get("node_type", "")
+        if nt == "processor":
+            plugin = n.get("plugin", "")
+            config = n.get("config", {})
+            metrics = n.get("metrics", {})
+
+            if plugin == "translate":
+                dp = config.get("dictionary_path", "")
+                if dp:
+                    deps.append(ExternalDependency(
+                        dep_type="dict_file", path=dp, plugin="translate",
+                        note="Dictionary file — pre-load into ES enrich index for migration"))
+
+            elif plugin == "grok":
+                pd = config.get("patterns_dir", "") or config.get("patterns_files_glob", "")
+                if pd:
+                    deps.append(ExternalDependency(
+                        dep_type="patterns_dir", path=str(pd), plugin="grok",
+                        note="Custom grok patterns directory — patterns must be added to ES grok processor config"))
+
+            elif plugin == "ruby":
+                ext = metrics.get("external_path", "") or config.get("path", "")
+                if ext:
+                    deps.append(ExternalDependency(
+                        dep_type="ruby_script", path=str(ext), plugin="ruby",
+                        note="External Ruby script — must be rewritten in Painless for ingest migration"))
+
+            elif plugin in ("http", "elasticsearch", "jdbc_streaming", "memcached"):
+                # Filter plugins that make outbound connections
+                url = (config.get("url") or config.get("hosts") or
+                       config.get("jdbc_connection_string") or "")
+                if url:
+                    type_map = {"http": "http_endpoint", "elasticsearch": "http_endpoint",
+                                "jdbc_streaming": "jdbc_db", "memcached": "http_endpoint"}
+                    deps.append(ExternalDependency(
+                        dep_type=type_map.get(plugin, "http_endpoint"),
+                        path=str(url), plugin=plugin,
+                        note=f"{plugin} filter makes outbound calls — no ingest equivalent, redesign required"))
+
+        elif nt == "sequence":
+            for c in n.get("children", []): walk(c)
+        elif nt == "conditional":
+            for b in n.get("branches", []): walk(b.get("body", {}))
+
+    walk(tree)
+
+    # Deduplicate by (dep_type, path)
+    seen: set = set()
+    unique: List[ExternalDependency] = []
+    for d in deps:
+        key = (d.dep_type, d.path)
+        if key not in seen:
+            seen.add(key); unique.append(d)
+    return unique
+
+
+# ─────────────────────────────────────────────────────────────
+# 9c. Business metadata sidecar  (new)
+# ─────────────────────────────────────────────────────────────
+
+def load_metadata_sidecar(path: Optional[str]) -> Dict[str, PipelineMetadata]:
+    """
+    Load optional pipeline business/operational metadata from a YAML or JSON
+    sidecar file.
+
+    Expected format (YAML):
+      ---
+      # pipeline_id: metadata
+      aixsyslogcef:
+        owner: "Network team"
+        customer: "Bank A"
+        environment: prod
+        criticality: high
+        volume: "500k events/day"
+        notes: "PCI DSS scope"
+
+      winlogbeat:
+        owner: "Security team"
+        criticality: critical
+
+    If the file does not exist or cannot be parsed, returns an empty dict
+    (all pipelines get default empty PipelineMetadata).
+
+    Accepts both YAML and JSON. JSON must be a top-level object keyed by
+    pipeline ID.
+    """
+    if not path:
+        return {}
+    p = Path(path)
+    if not p.exists():
+        return {}
+
+    raw = p.read_text(encoding="utf-8")
+
+    data: Dict[str, Any] = {}
+    try:
+        # Try JSON first (no external deps)
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        # Try simple YAML-style parsing (key: value, indented blocks)
+        # We implement a minimal YAML parser for the expected structure
+        # to avoid requiring PyYAML as a dependency.
+        current_pipeline: Optional[str] = None
+        current_block: Dict[str, str] = {}
+        for line in raw.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"): continue
+            if stripped.startswith("---"): continue
+
+            indent = len(line) - len(line.lstrip())
+            if indent == 0:
+                # Top-level pipeline ID
+                if current_pipeline and current_block:
+                    data[current_pipeline] = current_block
+                current_pipeline = stripped.rstrip(":")
+                current_block = {}
+            elif indent > 0 and ":" in stripped:
+                # Metadata field
+                k, _, v = stripped.partition(":")
+                current_block[k.strip()] = v.strip().strip('"').strip("'")
+
+        if current_pipeline and current_block:
+            data[current_pipeline] = current_block
+
+    result: Dict[str, PipelineMetadata] = {}
+    for pid, meta in data.items():
+        if isinstance(meta, dict):
+            result[pid] = PipelineMetadata(
+                owner=       str(meta.get("owner",       "")),
+                team=        str(meta.get("team",        "")),
+                customer=    str(meta.get("customer",    "")),
+                environment= str(meta.get("environment", "")),
+                criticality= str(meta.get("criticality", "")),
+                volume=      str(meta.get("volume",      "")),
+                notes=       str(meta.get("notes",       "")),
+            )
+    return result
+
+
+# ─────────────────────────────────────────────────────────────
+# 9d. Current → Target architecture summary  (new)
+# ─────────────────────────────────────────────────────────────
+
+def build_architecture(
+    row: Dict[str, Any],
+    deps: List[ExternalDependency],
+    blockers: List[Blocker],
+    wave: int,
+    is_pure: bool,
+    is_orch: bool,
+) -> Dict[str, Any]:
+    """
+    Generate a structured current→target architecture summary for one pipeline.
+
+    Returns:
+      {
+        current:  { inputs, filters, outputs, notes }
+        target:   { inputs, ingest_pipeline, manual_rewrites, outputs, notes }
+        gap:      [ list of gap descriptions ]
+      }
+    """
+    sources    = row.get("input_sources", []) or []
+    sinks      = row.get("terminal_sinks", []) or []
+    procs      = row.get("local_processors", {}) or {}
+    fts        = int(row.get("filter_transform_score", 0) or 0)
+    frs        = int(row.get("full_replacement_score",  0) or 0)
+
+    # ── Current ───────────────────────────────────────────
+    cur_inputs  = [s.replace("SOURCE:", "") for s in sources] or ["(pipeline input)"]
+    cur_filters = sorted(procs.keys())
+    cur_outputs = [s.replace("SINK:", "") for s in sinks] or ["(pipeline output)"]
+    cur_notes   = []
+    if deps:
+        cur_notes.append(f"{len(deps)} external file/service dep(s): " +
+                         ", ".join(f"{d.dep_type}:{Path(d.path).name}" for d in deps[:4]))
+
+    # ── Target ────────────────────────────────────────────
+    # Inputs
+    if any("jdbc" in s.lower() for s in sources):
+        tgt_inputs = ["Elastic JDBC Connector  OR  Kafka Connect JDBC Source"]
+    elif any("beats" in s.lower() for s in sources):
+        tgt_inputs = ["Elastic Agent (Fleet)"]
+    elif any("kafka" in s.lower() for s in sources):
+        tgt_inputs = ["Elastic Agent (Kafka input)  — verify option parity"]
+    elif any("http_poller" in s.lower() for s in sources):
+        tgt_inputs = ["Elastic Agent HTTP input  OR  custom Fleet integration"]
+    elif not sources:
+        tgt_inputs = ["(unchanged — receives from upstream ingest pipeline)"]
+    else:
+        tgt_inputs = ["Elastic Agent or Beats"]
+
+    # Filter → ingest
+    supported   = [p for p in cur_filters if p in INGEST_NATIVE]
+    partial     = [p for p in cur_filters if p in INGEST_PARTIAL]
+    unsupported = [p for p in cur_filters if p in INGEST_BLOCKERS]
+
+    tgt_ingest  = []
+    if supported:  tgt_ingest.append(f"Auto-migrate: {', '.join(sorted(supported))}")
+    if partial:    tgt_ingest.append(f"Needs work:   {', '.join(sorted(partial))}")
+
+    manual_rewrites = []
+    if unsupported:
+        for p in sorted(unsupported):
+            advice_map = {
+                "ruby":      "Rewrite in Painless script processor",
+                "aggregate": "Redesign as enrich policy or application-layer logic",
+                "elapsed":   "Replace with APM timing",
+                "clone":     "Redesign as pipeline fan-out",
+                "metrics":   "Replace with ES aggregations",
+                "jdbc_streaming": "Pre-load to enrich index",
+                "memcached": "Replace with enrich policy",
+                "cipher":    "Evaluate Painless or pre/post-process",
+                "http":      "Pre-enrich upstream",
+                "elasticsearch": "Replace with enrich policy",
+                "dns":       "Pre-resolve or accept missing enrichment",
+            }
+            manual_rewrites.append(f"{p}: {advice_map.get(p, 'Manual redesign required')}")
+
+    # Outputs
+    es_sinks = [s for s in sinks if "elasticsearch" in s.lower() or "opensearch" in s.lower()]
+    if wave == 1 or (wave == 2 and not any("kafka" in s.lower() or "file:" in s.lower() for s in sinks)):
+        tgt_outputs = [s.replace("SINK:", "") for s in es_sinks] or ["Elasticsearch (direct)"]
+        if len(sinks) > len(es_sinks):
+            other = [s.replace("SINK:","") for s in sinks if s not in es_sinks]
+            tgt_outputs.append(f"(Keep in Logstash: {', '.join(other)})")
+    else:
+        tgt_outputs = [s.replace("SINK:", "") for s in sinks]
+
+    tgt_notes = []
+    if wave == 2 and is_pure:
+        tgt_notes.append(f"Filter coverage: {fts}% auto-translatable")
+    if wave == 3 and is_orch:
+        tgt_notes.append("Keep orchestration in Logstash; filter logic may move to ingest")
+
+    # ── Gaps ─────────────────────────────────────────────
+    gaps: List[str] = []
+    for b in blockers:
+        if b.severity == "hard":
+            gaps.append(f"✗ {b.name}: {b.description[:70]}")
+        elif b.severity == "workaround":
+            gaps.append(f"⚠ {b.name}: {b.description[:70]}")
+    for d in deps:
+        gaps.append(f"  Dep: {d.dep_type} ({Path(d.path).name}) — {d.note[:60]}")
+
+    return {
+        "current": {
+            "inputs":  cur_inputs,
+            "filters": cur_filters,
+            "outputs": cur_outputs,
+            "notes":   cur_notes,
+        },
+        "target": {
+            "inputs":          tgt_inputs,
+            "ingest_pipeline": tgt_ingest,
+            "manual_rewrites": manual_rewrites,
+            "outputs":         tgt_outputs,
+            "notes":           tgt_notes,
+        },
+        "gap": gaps,
+        "coverage_pct": fts,
+    }
+
+
+# ─────────────────────────────────────────────────────────────
+# 9e. Pipeline pattern classifier
+# ─────────────────────────────────────────────────────────────
+
+# Primary pattern labels — evaluated top-to-bottom, first match wins
+PRIMARY_PATTERNS = [
+    "jdbc_polling",
+    "api_polling",
+    "kafka_consumer",
+    "xml_parsing",
+    "stateful_aggregation",
+    "ruby_custom",
+    "multi_output_routing",
+    "syslog_parsing",
+    "heavy_grok",
+    "json_ingestion",
+    "passthrough",
+    "enrichment_only",
+    "beats_simple",
+    "standard_transform",
+]
+
+# Workshop-friendly descriptions for each primary pattern
+PATTERN_DESCRIPTIONS: Dict[str, str] = {
+    "jdbc_polling":          "Scheduled JDBC database polling — no Elastic Agent equivalent",
+    "api_polling":           "HTTP API polling input — limited Elastic Agent parity",
+    "kafka_consumer":        "Kafka consumer — Elastic Agent Kafka input is the replacement path",
+    "xml_parsing":           "XML parsing — no native ingest equivalent, needs Painless or pre-parse",
+    "stateful_aggregation":  "Stateful aggregation (aggregate/elapsed) — architectural redesign required",
+    "ruby_custom":           "Non-trivial Ruby logic — must be rewritten in Painless or pre-processed",
+    "multi_output_routing":  "Fan-out to multiple outputs — ingest pipelines write to one index",
+    "syslog_parsing":        "Syslog/TCP/UDP input with grok parsing — Elastic Agent syslog input",
+    "heavy_grok":            "Complex grok parsing — consider dissect optimisation before migrating",
+    "json_ingestion":        "JSON field parsing without complex grok — clean ingest candidate",
+    "passthrough":           "Minimal filtering — pure pass-through, trivial to migrate",
+    "enrichment_only":       "Enrichment only (geoip/useragent) — clean ingest candidate",
+    "beats_simple":          "Simple Beats/Filebeat pipeline — best Wave 1 migration candidate",
+    "standard_transform":    "Standard grok+mutate+date transform — typical ingest migration",
+}
+
+# Migration portability per primary pattern (0–100 starting point before adjustments)
+PATTERN_BASE_PORTABILITY: Dict[str, int] = {
+    "jdbc_polling":          20,
+    "api_polling":           35,
+    "kafka_consumer":        60,
+    "xml_parsing":           40,
+    "stateful_aggregation":  10,
+    "ruby_custom":           35,
+    "multi_output_routing":  45,
+    "syslog_parsing":        75,
+    "heavy_grok":            70,
+    "json_ingestion":        90,
+    "passthrough":           98,
+    "enrichment_only":       88,
+    "beats_simple":          92,
+    "standard_transform":    78,
+}
+
+
+def _grok_perf_band(row: Dict[str, Any]) -> str:
+    """Return the worst grok performance band across all groks in a pipeline."""
+    tree = row.get("processors_ordered", {})
+    worst = "Fast"
+    order = {"Fast": 0, "Moderate": 1, "Slow": 2, "Very Slow": 3}
+
+    def walk(n: Dict[str, Any]) -> None:
+        nonlocal worst
+        nt = n.get("node_type", "")
+        if nt == "processor" and n.get("plugin") == "grok":
+            da = n.get("dissect_analysis") or {}
+            # Fall back to metrics-based scoring if dissect_analysis not present
+            metrics = n.get("metrics", {})
+            if metrics:
+                pc    = int(metrics.get("pattern_count", 0) or 0)
+                chars = int(metrics.get("pattern_chars",  0) or 0)
+                ac    = int(metrics.get("alternation_count", 0) or 0)
+                nc    = int(metrics.get("named_capture_count", 0) or 0)
+                score = pc * 3 + ac + nc + chars // 50
+                if metrics.get("heavy"): score += 5
+                band = ("Very Slow" if score >= 30 else
+                        "Slow"      if score >= 15 else
+                        "Moderate"  if score >= 6  else "Fast")
+                if order.get(band, 0) > order.get(worst, 0):
+                    worst = band
+        elif nt == "sequence":
+            for c in n.get("children", []): walk(c)
+        elif nt == "conditional":
+            for b in n.get("branches", []): walk(b.get("body", {}))
+
+    walk(tree)
+    return worst
+
+
+def classify_pipeline(row: Dict[str, Any]) -> PipelinePattern:
+    """
+    Assign one primary pattern label and any number of secondary tags.
+
+    Primary:  first matching rule in priority order (most specific first).
+    Tags:     all applicable traits — not mutually exclusive.
+    """
+    procs   = set((row.get("local_processors", {}) or {}).keys())
+    sources = row.get("input_sources",  []) or []
+    sinks   = row.get("terminal_sinks", []) or []
+    flags   = row.get("flags", []) or []
+    stmts   = int(row.get("total_statements", 0) or 0)
+    fts     = int(row.get("filter_transform_score", 0) or 0)
+
+    src_types = {s.lower() for s in sources}
+    sink_str  = " ".join(s.lower() for s in sinks)
+
+    def has_src(*types): return any(t in sl for t in types for sl in src_types)
+    def has_sink(*types): return any(t in sink_str for t in types)
+
+    grok_count = int((row.get("local_processors") or {}).get("grok", 0))
+    ruby_count = int((row.get("local_processors") or {}).get("ruby", 0))
+
+    # Grok metrics from tree
+    grok_band = _grok_perf_band(row)
+
+    # Get ruby complexity from metrics if available
+    ruby_complex = False
+    if ruby_count > 0:
+        for p in flatten_processors(row.get("processors_ordered", {})):
+            if p.get("plugin") == "ruby":
+                m = p.get("metrics", {})
+                ruby_complex = (
+                    int(m.get("inline_code_chars", 0) or 0) > 100 or
+                    bool(m.get("external_path")) or
+                    int(m.get("loop_keywords", 0) or 0) > 0 or
+                    bool(m.get("has_http")) or
+                    bool(m.get("has_require"))
+                )
+                if ruby_complex: break
+
+    es_only_output = (bool(sinks) and
+                      all("elasticsearch" in s.lower() or "opensearch" in s.lower()
+                          for s in sinks))
+    multi_out = (len(sinks) > 1 or
+                 len([o for o in (row.get("local_outputs") or []) if o]) > 1)
+    branch_count = int((row.get("migration") or {}).get("penalties", {}).get("branching", 0) > 0 or
+                       row.get("migration", {}) and row["migration"].get("filter_transform_score", 100) < 100 or 0)
+    # Use raw branch_count from aggregated data
+    bc = int(row.get("aggregated_processors", {}).get("grok", 0))  # placeholder; real below
+    # Safely get branch info
+    mig  = row.get("migration", {}) or {}
+    reasons = " ".join(mig.get("reasons", []))
+    has_branches = "conditional" in reasons or "branch" in reasons
+
+    # ── Primary pattern rules (priority order) ──────────────
+    if has_src("jdbc"):
+        primary = "jdbc_polling"
+    elif has_src("http_poller"):
+        primary = "api_polling"
+    elif has_src("kafka"):
+        primary = "kafka_consumer"
+    elif "xml" in procs:
+        primary = "xml_parsing"
+    elif "aggregate" in procs or "elapsed" in procs:
+        primary = "stateful_aggregation"
+    elif ruby_count > 0 and ruby_complex:
+        primary = "ruby_custom"
+    elif multi_out:
+        primary = "multi_output_routing"
+    elif has_src("syslog", "tcp", "udp"):
+        primary = "syslog_parsing"
+    elif grok_count >= 2 or grok_band in ("Slow", "Very Slow"):
+        primary = "heavy_grok"
+    elif "json" in procs and grok_count == 0 and ruby_count == 0:
+        primary = "json_ingestion"
+    elif stmts <= 2 and not (procs & {"grok", "ruby", "xml", "aggregate"}):
+        primary = "passthrough"
+    elif not (procs - {"geoip", "useragent", "mutate", "date"}) and (
+            "geoip" in procs or "useragent" in procs):
+        primary = "enrichment_only"
+    elif has_src("beats") and grok_count <= 1 and ruby_count == 0:
+        primary = "beats_simple"
+    else:
+        primary = "standard_transform"
+
+    # ── Secondary tags (computed independently) ──────────────
+    tags: List[str] = []
+
+    if ruby_count > 0:
+        tags.append("has_ruby")
+    if has_branches:
+        tags.append("has_conditionals")
+    if has_sink("kafka"):
+        tags.append("kafka_output")
+    if has_sink("file:"):
+        tags.append("file_output")
+    if "translate" in procs:
+        tags.append("has_translate")
+    if "geoip" in procs:
+        tags.append("has_geoip")
+    if "useragent" in procs:
+        tags.append("has_useragent")
+    if es_only_output:
+        tags.append("es_only_output")
+    if grok_band in ("Slow", "Very Slow"):
+        tags.append("high_grok_cost")
+    if any(d.dep_type in ("dict_file", "ruby_script", "patterns_dir")
+           for d in []):  # ext_deps not available here — set from caller
+        tags.append("has_external_deps")
+    if len((row.get("files") or [])) > 1:
+        tags.append("split_file_pair")
+    if not (row.get("input_sources") or []) and not (row.get("terminal_sinks") or []):
+        tags.append("chain_pipeline")
+    if any(f.startswith("dead_end") for f in flags):
+        tags.append("dead_end")
+    if any(f.startswith("unresolved") for f in flags):
+        tags.append("unresolved_routing")
+    if grok_count > 0:
+        tags.append(f"grok_perf_{grok_band.lower().replace(' ','_')}")
+    if "dissect" in procs:
+        tags.append("uses_dissect")
+    if "fingerprint" in procs:
+        tags.append("uses_fingerprint")
+
+    # ── Portability and coupling scores ──────────────────────
+    portability = PATTERN_BASE_PORTABILITY.get(primary, 70)
+    # Adjust portability
+    if ruby_count > 0 and ruby_complex: portability -= 20
+    elif ruby_count > 0:               portability -= 10
+    if "aggregate" in procs:           portability -= 25
+    if "xml" in procs:                 portability -= 15
+    if multi_out:                      portability -= 10
+    if "translate" in procs:           portability -= 10
+    if has_sink("kafka"):              portability -= 10
+    if has_sink("file:"):              portability -= 8
+    if grok_band == "Very Slow":       portability -= 8
+    if grok_band == "Slow":            portability -= 4
+    if es_only_output:                 portability += 8
+    portability = max(0, min(100, portability))
+
+    # Coupling score (0–100 — higher = more external dependencies)
+    coupling = 0
+    if has_src("jdbc"):                coupling += 30
+    if has_src("http_poller"):         coupling += 20
+    if ruby_count > 0 and ruby_complex: coupling += 15
+    if "translate" in procs:           coupling += 10
+    if has_src("kafka"):               coupling += 10
+    if has_sink("kafka"):              coupling += 10
+    if multi_out:                      coupling += 10
+    if "elasticsearch" in procs:       coupling += 8   # ES lookup filter
+    coupling = min(100, coupling)
+
+    # ── Complexity band ───────────────────────────────────────
+    score = int(row.get("total_score", 0) or 0)
+    stmts = int(row.get("total_statements", 0) or 0)
+    complexity = ("High"   if score > 120 or stmts > 60 or
+                             "stateful" in primary or "ruby_custom" == primary
+                  else "Medium" if score > 40 or stmts > 20
+                  else "Low")
+
+    return PipelinePattern(
+        primary=primary,
+        tags=sorted(set(tags)),
+        portability=portability,
+        coupling=coupling,
+        complexity=complexity,
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# 9f. Anti-pattern detection
+# ─────────────────────────────────────────────────────────────
+
+def detect_anti_patterns(row: Dict[str, Any]) -> List[AntiPatternFlag]:
+    """
+    Scan one pipeline row for concrete anti-patterns.
+    Returns a list of AntiPatternFlag objects, one per finding.
+    """
+    flags: List[AntiPatternFlag] = []
+    procs   = row.get("local_processors", {}) or {}
+    sources = row.get("input_sources",  []) or []
+    sinks   = row.get("terminal_sinks", []) or []
+    row_flags = row.get("flags", []) or []
+    tree    = row.get("processors_ordered", {})
+    all_procs = flatten_processors(tree)
+
+    src_types = {s.lower() for s in sources}
+    sink_str  = " ".join(s.lower() for s in sinks)
+
+    # ── AP-1: Dead-end pipeline ───────────────────────────────
+    if not sinks and not (row.get("local_outputs") or []):
+        flags.append(AntiPatternFlag(
+            anti_pattern_id="dead_end_pipeline",
+            name="Dead-end pipeline",
+            severity="high",
+            description="Pipeline has no output destination — events are silently dropped.",
+            recommendation="Add an Elasticsearch or pipeline output, or confirm this pipeline "
+                           "is intentionally disabled.",
+        ))
+
+    # ── AP-2: GREEDYDATA in non-final position ────────────────
+    for p in all_procs:
+        if p.get("plugin") != "grok": continue
+        config = p.get("config", {})
+        match  = config.get("match", {})
+        patterns: List[str] = []
+        if isinstance(match, dict):
+            for v in match.values():
+                if isinstance(v, str): patterns.append(v)
+                elif isinstance(v, list): patterns.extend(v)
+        elif isinstance(match, list):
+            for i in range(1, len(match), 2): patterns.append(str(match[i]))
+        for pat in patterns:
+            parts = re.findall(r'%\{([^}]+)\}', pat)
+            for i, inner in enumerate(parts):
+                pname = inner.split(":")[0].upper()
+                if pname == "GREEDYDATA" and i < len(parts) - 1:
+                    flags.append(AntiPatternFlag(
+                        anti_pattern_id="greedydata_non_final",
+                        name="GREEDYDATA in non-final position",
+                        severity="high",
+                        description=f"Pattern '{pat[:70]}' uses GREEDYDATA before the last capture. "
+                                    "This matches everything including delimiters and causes "
+                                    "catastrophic backtracking.",
+                        recommendation="Move GREEDYDATA to the final position, or replace "
+                                       "mid-pattern usage with DATA (lazy match).",
+                    ))
+                    break  # one flag per grok block is enough
+
+    # ── AP-3: Multi-pattern grok with alternation ─────────────
+    for p in all_procs:
+        if p.get("plugin") != "grok": continue
+        m = p.get("metrics", {})
+        pc = int(m.get("pattern_count", 0) or 0)
+        ac = int(m.get("alternation_count", 0) or 0)
+        if pc >= 3 or (pc >= 2 and ac >= 2):
+            flags.append(AntiPatternFlag(
+                anti_pattern_id="high_alternation_grok",
+                name="High-alternation grok",
+                severity="medium",
+                description=f"Grok has {pc} match pattern(s) with {ac} alternation(s). "
+                            "Multiple alternatives cause excessive backtracking under load.",
+                recommendation="Use dissect for the common case + grok as a fallback only. "
+                               "Pre-filter events by type before hitting the grok block.",
+            ))
+            break  # one flag per pipeline
+
+    # ── AP-4: Ruby for trivial field manipulation ─────────────
+    for p in all_procs:
+        if p.get("plugin") != "ruby": continue
+        m = p.get("metrics", {})
+        lines  = int(m.get("inline_code_lines", 0) or 0)
+        chars  = int(m.get("inline_code_chars", 0) or 0)
+        has_loop = int(m.get("loop_keywords", 0) or 0) > 0
+        has_http = bool(m.get("has_http"))
+        has_req  = bool(m.get("has_require"))
+        ext      = m.get("external_path")
+        if not (has_loop or has_http or has_req or ext) and lines <= 4 and chars <= 200:
+            flags.append(AntiPatternFlag(
+                anti_pattern_id="trivial_ruby",
+                name="Ruby used for simple field mutation",
+                severity="medium",
+                description=f"Ruby block is {lines} line(s) / {chars} chars with no loops, "
+                            "HTTP calls, or requires — likely replaceable with mutate or "
+                            "a script processor.",
+                recommendation="Replace with mutate (add_field, rename, convert) or a "
+                               "minimal Painless script processor. Removes the JRuby overhead.",
+            ))
+
+    # ── AP-5: Unresolved send_to target ───────────────────────
+    if any(f.startswith("unresolved") for f in row_flags):
+        unresolved = [o for o in (row.get("local_outputs") or [])
+                      if o and not o.startswith("SINK:")]
+        flags.append(AntiPatternFlag(
+            anti_pattern_id="unresolved_routing",
+            name="Unresolved pipeline routing target",
+            severity="high",
+            description=f"Pipeline routes to address(es) {unresolved[:3]} that have no "
+                        "matching input definition in the scanned files.",
+            recommendation="Locate the missing pipeline definition, or confirm routing "
+                           "is intentionally external (e.g. a different pipelines.yml).",
+        ))
+
+    # ── AP-6: JDBC with no schedule (runs once at startup) ────
+    if any("jdbc" in s.lower() for s in sources):
+        raw_in = row.get("raw_input_text", "") or ""
+        has_schedule = "schedule" in raw_in.lower()
+        if not has_schedule:
+            flags.append(AntiPatternFlag(
+                anti_pattern_id="jdbc_no_schedule",
+                name="JDBC input with no schedule",
+                severity="medium",
+                description="JDBC input has no schedule => directive — runs once at "
+                            "Logstash startup only, then stops.",
+                recommendation="Add a schedule (e.g. '* * * * *') or confirm this "
+                               "pipeline is triggered externally via the Logstash API.",
+            ))
+
+    # ── AP-7: Large inline translate dictionary ───────────────
+    for p in all_procs:
+        if p.get("plugin") != "translate": continue
+        m = p.get("metrics", {})
+        entries  = int(m.get("dictionary_entries", 0) or 0)
+        has_file = bool(m.get("has_file"))
+        if entries > 50 and not has_file:
+            flags.append(AntiPatternFlag(
+                anti_pattern_id="large_inline_dictionary",
+                name="Large inline translate dictionary",
+                severity="low",
+                description=f"Translate filter has {entries} inline dictionary entries. "
+                            "Large inline dicts increase config size and slow reloads.",
+                recommendation="Move dictionary to dictionary_path file, or pre-load "
+                               "into an Elasticsearch enrich index for ingest migration.",
+            ))
+
+    # ── AP-8: Kafka output without Elasticsearch output ───────
+    has_kafka_out = "kafka" in sink_str
+    has_es_out    = "elasticsearch" in sink_str or "opensearch" in sink_str
+    if has_kafka_out and not has_es_out:
+        flags.append(AntiPatternFlag(
+            anti_pattern_id="kafka_only_output",
+            name="Kafka-only output (no Elasticsearch)",
+            severity="info",
+            description="Pipeline writes only to Kafka, not directly to Elasticsearch. "
+                        "This is a routing/transformation layer, not a terminal indexing step.",
+            recommendation="Document data flow clearly. During migration, determine whether "
+                           "the downstream Kafka consumer also needs to be migrated.",
+        ))
+
+    # ── AP-9: Duplicate grok pattern (cross-pipeline) ─────────
+    # This one is computed cross-pipeline in build_anti_pattern_summary;
+    # here we just mark a flag that can be set by the caller.
+    # (Skipped per-pipeline — handled at the summary level)
+
+    # ── AP-10: Clone filter (event duplication without fan-out config) ──
+    if "clone" in procs:
+        flags.append(AntiPatternFlag(
+            anti_pattern_id="clone_filter",
+            name="clone filter (event duplication)",
+            severity="medium",
+            description="clone creates duplicate events in-pipeline. "
+                        "No ingest pipeline equivalent exists.",
+            recommendation="Redesign as pipeline fan-out at the data source level, "
+                           "or use index aliases / cross-cluster replication.",
+        ))
+
+    # ── AP-11: Multiple outputs to same Elasticsearch cluster ─
+    es_sinks = [s for s in sinks if "elasticsearch" in s.lower() or "opensearch" in s.lower()]
+    if len(es_sinks) > 1:
+        flags.append(AntiPatternFlag(
+            anti_pattern_id="multiple_es_outputs",
+            name="Multiple Elasticsearch outputs",
+            severity="low",
+            description=f"Pipeline writes to {len(es_sinks)} separate Elasticsearch outputs: "
+                        f"{', '.join(s[:40] for s in es_sinks[:3])}.",
+            recommendation="Consider using dynamic index naming (%{{[field]}}) in a single "
+                           "output, or route via pipeline fan-out.",
+        ))
+
+    return flags
+
+
+# ─────────────────────────────────────────────────────────────
+# 9g. Cross-pipeline pattern and anti-pattern summaries
+# ─────────────────────────────────────────────────────────────
+
+def build_pattern_summary(advices: List[PipelineAdvice]) -> List[Dict[str, Any]]:
+    """
+    Aggregate per-pipeline patterns into a workshop-ready summary table.
+
+    One row per primary pattern, sorted by pipeline count descending.
+    """
+    buckets: Dict[str, List[PipelineAdvice]] = defaultdict(list)
+    for a in advices:
+        if a.pattern:
+            buckets[a.pattern.primary].append(a)
+        else:
+            buckets["unknown"].append(a)
+
+    rows_out: List[Dict[str, Any]] = []
+    for primary, members in buckets.items():
+        total = len(members)
+        if total == 0: continue
+
+        # Common plugins across all pipelines in this pattern
+        plugin_counter: Counter = Counter()
+        for a in members:
+            # pipeline_id → row map not available here; use fingerprint for plugins
+            fp = a.processor_fingerprint or ""
+            # Extract proc names from fingerprint: "procs:grok+mutate|src:..."
+            m = re.match(r'procs:([^|]+)', fp)
+            if m:
+                for plugin in m.group(1).split("+"):
+                    if plugin and plugin != "(none)":
+                        plugin_counter[plugin] += 1
+        top_plugins = [p for p, _ in plugin_counter.most_common(6)]
+
+        avg_portability = round(sum(a.pattern.portability for a in members
+                                    if a.pattern) / total, 0) if total else 0
+        avg_coupling    = round(sum(a.pattern.coupling    for a in members
+                                    if a.pattern) / total, 0) if total else 0
+        avg_benefit     = round(sum(a.operational_benefit for a in members) / total, 0)
+        avg_fts         = round(sum(int(a.architecture.get("coverage_pct", 0) or 0)
+                                    for a in members) / total, 0)
+
+        wave_dist = Counter(a.wave for a in members)
+        complexity_dist = Counter(a.pattern.complexity for a in members if a.pattern)
+
+        rows_out.append({
+            "pattern":             primary,
+            "description":         PATTERN_DESCRIPTIONS.get(primary, ""),
+            "pipeline_count":      total,
+            "pct_of_total":        0.0,   # filled in after
+            "top_plugins":         top_plugins,
+            "complexity_dist":     dict(complexity_dist),
+            "dominant_complexity": complexity_dist.most_common(1)[0][0] if complexity_dist else "?",
+            "avg_portability":     int(avg_portability),
+            "avg_coupling":        int(avg_coupling),
+            "avg_benefit":         int(avg_benefit),
+            "avg_filter_coverage": int(avg_fts),
+            "wave_distribution":   dict(wave_dist),
+            "wave1_count":         wave_dist.get(1, 0),
+            "wave2_count":         wave_dist.get(2, 0),
+            "wave3_count":         wave_dist.get(3, 0),
+            "pipeline_ids":        [a.pipeline_id for a in members],
+        })
+
+    # Fill in percentages
+    grand_total = sum(r["pipeline_count"] for r in rows_out)
+    for r in rows_out:
+        r["pct_of_total"] = round(r["pipeline_count"] * 100 / grand_total, 1) if grand_total else 0
+
+    rows_out.sort(key=lambda r: -r["pipeline_count"])
+    return rows_out
+
+
+def build_anti_pattern_summary(advices: List[PipelineAdvice]) -> List[Dict[str, Any]]:
+    """
+    Aggregate all anti-pattern findings cross-pipeline.
+
+    One row per anti-pattern type, sorted by pipeline count descending.
+    Also adds cross-pipeline "duplicate grok pattern" detection.
+    """
+    # Cross-pipeline duplicate grok pattern detection
+    grok_pattern_index: Dict[str, List[str]] = defaultdict(list)
+    for a in advices:
+        # Get grok patterns from the fingerprint or field inventory
+        for target in a.field_inventory.grok_targets:
+            grok_pattern_index[target].append(a.pipeline_id)
+
+    duplicate_grok_pipelines: Set[str] = set()
+    for target, pids in grok_pattern_index.items():
+        if len(pids) >= 3:
+            for pid in pids:
+                duplicate_grok_pipelines.add(pid)
+
+    # Inject duplicate_grok flag on relevant advices
+    for a in advices:
+        if a.pipeline_id in duplicate_grok_pipelines:
+            already = any(ap.anti_pattern_id == "duplicate_grok_pattern"
+                          for ap in a.anti_patterns)
+            if not already:
+                a.anti_patterns.append(AntiPatternFlag(
+                    anti_pattern_id="duplicate_grok_pattern",
+                    name="Duplicate grok capture fields",
+                    severity="medium",
+                    description="This pipeline captures the same named fields as 3+ other pipelines, "
+                                "suggesting repeated parsing logic that could be standardised.",
+                    recommendation="Consider a shared ingest pipeline template for the common "
+                                   "parsing logic, reducing duplication across pipelines.",
+                ))
+
+    # Aggregate by anti_pattern_id
+    buckets: Dict[str, List[Tuple[str, AntiPatternFlag]]] = defaultdict(list)
+    for a in advices:
+        for ap in a.anti_patterns:
+            buckets[ap.anti_pattern_id].append((a.pipeline_id, ap))
+
+    rows_out: List[Dict[str, Any]] = []
+    for apid, entries in buckets.items():
+        pipeline_ids = list(dict.fromkeys(pid for pid, _ in entries))
+        sample_flag  = entries[0][1]
+        rows_out.append({
+            "anti_pattern_id":  apid,
+            "name":             sample_flag.name,
+            "severity":         sample_flag.severity,
+            "pipeline_count":   len(pipeline_ids),
+            "description":      sample_flag.description,
+            "recommendation":   sample_flag.recommendation,
+            "pipeline_ids":     pipeline_ids,
+        })
+
+    severity_order = {"high": 0, "medium": 1, "low": 2, "info": 3}
+    rows_out.sort(key=lambda r: (severity_order.get(r["severity"], 9), -r["pipeline_count"]))
+    return rows_out
+
+
+# ─────────────────────────────────────────────────────────────
 # 9. Main analysis pass
 # ─────────────────────────────────────────────────────────────
 
-def analyse(data: Dict[str, Any]) -> MigrationPlan:
+def analyse(data: Dict[str, Any], metadata_path: Optional[str] = None) -> MigrationPlan:
     """Run the full advisor analysis over the analyzer JSON output."""
     rows    = data.get("logical_pipelines", [])
     edges   = data.get("logical_edges", {})
@@ -1020,6 +1974,9 @@ def analyse(data: Dict[str, Any]) -> MigrationPlan:
     scan_root = summary.get("scan_root", "")
 
     all_ids = {r.get("pipeline", "") for r in rows}
+
+    # Load optional business metadata sidecar
+    metadata_map = load_metadata_sidecar(metadata_path)
 
     advices: List[PipelineAdvice] = []
 
@@ -1031,6 +1988,9 @@ def analyse(data: Dict[str, Any]) -> MigrationPlan:
 
         # Field inventory
         inv = build_field_inventory(tree)
+
+        # External dependencies
+        ext_deps = extract_external_deps(row)
 
         # Blockers
         blockers = extract_blockers(row)
@@ -1051,8 +2011,20 @@ def analyse(data: Dict[str, Any]) -> MigrationPlan:
         # Decision
         decision = make_decision(wave, is_pure, is_orch, fts, frs)
 
+        # Architecture summary
+        arch = build_architecture(row, ext_deps, blockers, wave, is_pure, is_orch)
+
         # Fingerprint
         fp = build_fingerprint(row)
+
+        # Business metadata (empty defaults if not in sidecar)
+        meta = metadata_map.get(pid, PipelineMetadata())
+
+        # Pattern classification
+        pat = classify_pipeline(row)
+
+        # Anti-pattern detection
+        anti_pats = detect_anti_patterns(row)
 
         advices.append(PipelineAdvice(
             pipeline_id=pid,
@@ -1065,11 +2037,16 @@ def analyse(data: Dict[str, Any]) -> MigrationPlan:
             decision=decision,
             blockers=blockers,
             field_inventory=inv,
-            cluster_id=None,       # filled in by cluster_pipelines
+            external_deps=ext_deps,
+            metadata=meta,
+            architecture=arch,
+            cluster_id=None,
             cluster_template=False,
             processor_fingerprint=fp,
             is_pure_transformer=is_pure,
             is_orchestrator=is_orch,
+            pattern=pat,
+            anti_patterns=anti_pats,
         ))
 
     # Sort within wave by benefit descending (best ROI first)
@@ -1106,6 +2083,17 @@ def analyse(data: Dict[str, Any]) -> MigrationPlan:
     all_inputs  = build_input_inventory(rows, advices)
     all_outputs = build_output_inventory(rows, advices)
     all_fields  = build_global_field_inventory(advices)
+    pat_summary  = build_pattern_summary(advices)
+    anti_summary = build_anti_pattern_summary(advices)  # also injects cross-pipeline flags
+
+    # Enrich summary_text with pattern counts
+    pat_counts = Counter(a.pattern.primary for a in advices if a.pattern)
+    top_patterns = pat_counts.most_common(4)
+    pat_line = "  Top patterns: " + "  •  ".join(
+        f"{p} ({n})" for p, n in top_patterns
+    )
+    total_anti = sum(len(a.anti_patterns) for a in advices)
+    anti_line  = f"  Anti-patterns detected: {total_anti} across {sum(1 for a in advices if a.anti_patterns)} pipeline(s)\n"
 
     return MigrationPlan(
         generated_at=datetime.datetime.now().isoformat(timespec="seconds"),
@@ -1114,10 +2102,12 @@ def analyse(data: Dict[str, Any]) -> MigrationPlan:
         wave_counts=dict(wave_counts),
         clusters=clusters,
         pipelines=advices,
-        summary_text=summary_text,
+        summary_text=summary_text + pat_line + "\n" + anti_line,
         all_inputs=all_inputs,
         all_outputs=all_outputs,
         all_fields=all_fields,
+        pattern_summary=pat_summary,
+        anti_pattern_summary=anti_summary,
     )
 
 # ─────────────────────────────────────────────────────────────
@@ -1174,13 +2164,18 @@ def print_plan(plan: MigrationPlan, wave_filter: Optional[int], top_n: int,
         print("─" * 90)
         print(f"{wc}{WAVE_LABELS[wave_num]}{RESET}")
         print()
-        print(f"{'PIPELINE':<36} {'Benefit':>7} {'Effort':<7} {'FTS':>4} {'Decision':<45}")
+        print(f"{'PIPELINE':<36} {'Pattern':<22} {'Port':>4} {'Benefit':>7} {'Effort':<7} {'Decision':<38}")
         print("─" * 90)
         for a in members:
+            crit = a.metadata.criticality
+            crit_badge = f" [{crit.upper()}]" if crit else ""
+            pat_label  = a.pattern.primary if a.pattern else "?"
+            port       = a.pattern.portability if a.pattern else 0
+            ap_badge   = f" ⚑{len(a.anti_patterns)}" if a.anti_patterns else ""
             print(f"{wc}{col(a.pipeline_id,36)}{RESET} "
+                  f"{col(pat_label,22)} {port:>4}  "
                   f"{a.operational_benefit:>7}  {a.migration_effort:<7}"
-                  f"{col(a.wave_reason[:4] if False else str(int(a.pipeline_id and 0) or 0),0)}"  # placeholder
-                  f"{col(a.decision, 45)}")
+                  f"{col(a.decision, 38)}{crit_badge}{ap_badge}")
 
         # Detail for Wave 1 (most actionable)
         if wave_num == 1:
@@ -1189,7 +2184,15 @@ def print_plan(plan: MigrationPlan, wave_filter: Optional[int], top_n: int,
             for i, a in enumerate(members, 1):
                 icon = "⭐" if a.is_pure_transformer else "→"
                 tmpl = f" [cluster template: {a.cluster_id}]" if a.cluster_template else ""
-                print(f"  {i:2d}. {icon} {a.pipeline_id}{tmpl}")
+                meta_str = ""
+                if a.metadata.customer:  meta_str += f"  customer={a.metadata.customer}"
+                if a.metadata.criticality: meta_str += f"  criticality={a.metadata.criticality}"
+                print(f"  {i:2d}. {icon} {a.pipeline_id}{tmpl}{meta_str}")
+                print(f"       Pattern:  {a.pattern.primary if a.pattern else '?'}"
+                      f"  tags=[{', '.join((a.pattern.tags or [])[:4])}]"
+                      f"  portability={a.pattern.portability if a.pattern else '?'}"
+                      f"  coupling={a.pattern.coupling if a.pattern else '?'}"
+                      if a.pattern else f"  {a.pipeline_id}")
                 print(f"       Benefit: {a.operational_benefit}/100  "
                       f"Effort: {a.migration_effort} ({a.effort_score})  "
                       f"Decision: {a.decision}")
@@ -1197,29 +2200,176 @@ def print_plan(plan: MigrationPlan, wave_filter: Optional[int], top_n: int,
                     for b in a.blockers[:2]:
                         sev_icon = {"hard":"✗","workaround":"⚠","decision":"?"}[b.severity]
                         print(f"       {sev_icon} {b.name}: {b.recommendation[:65]}")
+                if a.external_deps:
+                    for d in a.external_deps[:2]:
+                        print(f"       📎 {d.dep_type}: {d.path[:55]}")
+                if a.anti_patterns:
+                    for ap in a.anti_patterns[:2]:
+                        sev_icon = {"high":"✗","medium":"⚠","low":"·","info":"ℹ"}.get(ap.severity,"·")
+                        print(f"       {sev_icon} AP: {ap.name}")
                 print()
 
         elif wave_num == 2:
             print()
             for a in members[:8]:
-                print(f"  • {a.pipeline_id}")
+                meta_str = f"  [{a.metadata.criticality.upper()}]" if a.metadata.criticality else ""
+                pat_str  = f"  pattern={a.pattern.primary}" if a.pattern else ""
+                print(f"  • {a.pipeline_id}{meta_str}{pat_str}")
                 print(f"    Decision: {a.decision}")
                 print(f"    Reason:   {a.wave_reason[:80]}")
                 if a.blockers:
                     for b in a.blockers[:3]:
                         sev_icon = {"hard":"✗","workaround":"⚠","decision":"?"}[b.severity]
                         print(f"    {sev_icon} {b.name}: {b.recommendation[:65]}")
+                if a.external_deps:
+                    print(f"    📎 Deps: {', '.join(d.dep_type+':'+Path(d.path).name for d in a.external_deps[:3])}")
+                if a.anti_patterns:
+                    for ap in a.anti_patterns[:2]:
+                        sev_icon = {"high":"✗","medium":"⚠","low":"·","info":"ℹ"}.get(ap.severity,"·")
+                        print(f"    {sev_icon} AP: {ap.name}: {ap.recommendation[:60]}")
                 print()
 
         elif wave_num == 3:
             print()
             for a in members[:8]:
-                print(f"  • {a.pipeline_id}")
+                meta_str = f"  [{a.metadata.criticality.upper()}]" if a.metadata.criticality else ""
+                print(f"  • {a.pipeline_id}{meta_str}")
                 print(f"    Decision: {a.decision}")
                 hard_names = [b.name for b in a.blockers if b.severity == "hard"]
                 if hard_names:
                     print(f"    Hard blockers: {', '.join(hard_names)}")
+                if a.external_deps:
+                    print(f"    📎 Deps: {', '.join(d.dep_type+':'+Path(d.path).name for d in a.external_deps[:3])}")
                 print()
+
+    # ── PATTERN SUMMARY ───────────────────────────────────
+    if plan.pattern_summary:
+        print("─" * 90)
+        print("PATTERN SUMMARY  (workshop view — all pipelines classified by primary pattern)")
+        print()
+        # Header
+        print(f"  {'PATTERN':<24} {'#':>4} {'%':>5}  {'Complexity':<10} "
+              f"{'Port':>4} {'Coup':>4}  {'W1':>3} {'W2':>3} {'W3':>3}  "
+              f"{'Filt%':>5}  Description")
+        print(f"  {'─'*24} {'─'*4} {'─'*5}  {'─'*10} "
+              f"{'─'*4} {'─'*4}  {'─'*3} {'─'*3} {'─'*3}  "
+              f"{'─'*5}  {'─'*38}")
+        for r in plan.pattern_summary:
+            desc = PATTERN_DESCRIPTIONS.get(r["pattern"], "")[:38]
+            print(f"  {r['pattern']:<24} {r['pipeline_count']:>4} {r['pct_of_total']:>5.1f}%"
+                  f"  {r['dominant_complexity']:<10} "
+                  f"{r['avg_portability']:>4} {r['avg_coupling']:>4}  "
+                  f"{r['wave1_count']:>3} {r['wave2_count']:>3} {r['wave3_count']:>3}  "
+                  f"{r['avg_filter_coverage']:>4}%  {desc}")
+        print()
+        # Summary notes for workshop
+        print("  Notes:")
+        print("    Port = Portability score (0–100, higher = easier to migrate)")
+        print("    Coup = Coupling score (0–100, higher = more external dependencies)")
+        print("    W1/W2/W3 = pipeline count per migration wave")
+        print()
+
+    # ── ANTI-PATTERNS DETECTED ────────────────────────────
+    if plan.anti_pattern_summary:
+        print("─" * 90)
+        print("ANTI-PATTERNS DETECTED  (across all pipelines)")
+        print()
+        sev_colors = {
+            "high":   "\033[91m" if use_color else "",
+            "medium": "\033[93m" if use_color else "",
+            "low":    "\033[96m" if use_color else "",
+            "info":   "\033[90m" if use_color else "",
+        }
+        print(f"  {'SEV':<7} {'ANTI-PATTERN':<36} {'PIPELINES':>9}  RECOMMENDATION")
+        print(f"  {'─'*7} {'─'*36} {'─'*9}  {'─'*40}")
+        for r in plan.anti_pattern_summary:
+            sc = sev_colors.get(r["severity"], "")
+            print(f"  {sc}{r['severity'].upper():<7}{RESET} "
+                  f"{col(r['name'], 36)} {r['pipeline_count']:>9}  "
+                  f"{r['recommendation'][:50]}")
+        print()
+        # Per-pipeline list for high-severity findings
+        high = [r for r in plan.anti_pattern_summary if r["severity"] == "high"]
+        if high:
+            print("  High-severity detail:")
+            for r in high:
+                pids = ", ".join(r["pipeline_ids"][:5])
+                overflow = f"  … +{len(r['pipeline_ids'])-5} more" if len(r['pipeline_ids']) > 5 else ""
+                print(f"  ✗ {r['name']}")
+                print(f"    Pipelines: {pids}{overflow}")
+                print(f"    Fix: {r['recommendation'][:75]}")
+                print()
+
+    # ── CURRENT → TARGET ARCHITECTURE ────────────────────
+    print("─" * 90)
+    print("CURRENT → TARGET ARCHITECTURE  (per pipeline)")
+    print()
+    shown = 0
+    # Show Wave 1 first, then Wave 2, capped at top_n total
+    for a in plan.pipelines:
+        if shown >= min(top_n, 20): break
+        arch = a.architecture
+        cur  = arch.get("current", {})
+        tgt  = arch.get("target",  {})
+        gaps = arch.get("gap",     [])
+        cov  = arch.get("coverage_pct", 0)
+
+        meta_tags = []
+        if a.metadata.customer:    meta_tags.append(f"customer={a.metadata.customer}")
+        if a.metadata.environment: meta_tags.append(f"env={a.metadata.environment}")
+        if a.metadata.owner:       meta_tags.append(f"owner={a.metadata.owner}")
+        meta_str = f"  ({', '.join(meta_tags)})" if meta_tags else ""
+
+        wc_color = C.get(a.wave, "")
+        print(f"  {wc_color}{'─'*3} {a.pipeline_id}  [Wave {a.wave}]{RESET}{meta_str}")
+
+        # Current
+        print(f"  │  CURRENT:")
+        print(f"  │    Input:   {', '.join(cur.get('inputs', []))}")
+        print(f"  │    Filters: {', '.join(cur.get('filters', [])) or '(none)'}")
+        print(f"  │    Output:  {', '.join(cur.get('outputs', []))}")
+        for note in cur.get("notes", []):
+            print(f"  │    ⚠ {note}")
+
+        # Target
+        print(f"  │  TARGET  (filter coverage: {cov}%):")
+        print(f"  │    Input:   {', '.join(tgt.get('inputs', []))}")
+        ingest = tgt.get("ingest_pipeline", [])
+        if ingest:
+            for line in ingest: print(f"  │    Ingest:  {line}")
+        rewrites = tgt.get("manual_rewrites", [])
+        if rewrites:
+            for r in rewrites: print(f"  │    ✎ Manual: {r}")
+        print(f"  │    Output:  {', '.join(tgt.get('outputs', []))}")
+        for note in tgt.get("notes", []):
+            print(f"  │    ℹ {note}")
+
+        # Gaps
+        if gaps:
+            print(f"  │  GAPS:")
+            for g in gaps[:4]: print(f"  │    {g}")
+
+        print(f"  │")
+        shown += 1
+
+    # ── EXTERNAL DEPENDENCIES ─────────────────────────────
+    all_deps = [(a.pipeline_id, d) for a in plan.pipelines for d in a.external_deps]
+    if all_deps:
+        print("─" * 90)
+        print("EXTERNAL DEPENDENCIES  (files, DBs, services referenced across all pipelines)")
+        print()
+        by_type: Dict[str, List[Tuple[str,ExternalDependency]]] = defaultdict(list)
+        for pid, d in all_deps:
+            by_type[d.dep_type].append((pid, d))
+        for dtype, entries in sorted(by_type.items()):
+            print(f"  ┌─ {dtype.replace('_',' ').title()} ({len(entries)}) {'─'*max(0,50-len(dtype))}")
+            for pid, d in entries[:15]:
+                print(f"  │  {pid:<30}  {d.path[:50]}")
+                print(f"  │  {'':30}  → {d.note[:55]}")
+            if len(entries) > 15:
+                print(f"  │  … {len(entries)-15} more")
+            print(f"  └{'─'*60}")
+            print()
 
     # ── ALL INPUTS ────────────────────────────────────────
     print("─" * 90)
@@ -1372,14 +2522,48 @@ def write_json(plan: MigrationPlan, path: str) -> None:
                     "timestamp_target": a.field_inventory.timestamp_target,
                     "kv_target":        a.field_inventory.kv_target,
                 },
+                "external_deps": [
+                    {"dep_type": d.dep_type, "path": d.path,
+                     "plugin": d.plugin, "note": d.note}
+                    for d in a.external_deps
+                ],
+                "metadata": {
+                    "owner":       a.metadata.owner,
+                    "team":        a.metadata.team,
+                    "customer":    a.metadata.customer,
+                    "environment": a.metadata.environment,
+                    "criticality": a.metadata.criticality,
+                    "volume":      a.metadata.volume,
+                    "notes":       a.metadata.notes,
+                },
+                "architecture": a.architecture,
+                "pattern": {
+                    "primary":     a.pattern.primary     if a.pattern else None,
+                    "tags":        a.pattern.tags         if a.pattern else [],
+                    "portability": a.pattern.portability  if a.pattern else None,
+                    "coupling":    a.pattern.coupling     if a.pattern else None,
+                    "complexity":  a.pattern.complexity   if a.pattern else None,
+                } if a.pattern else None,
+                "anti_patterns": [
+                    {
+                        "id":             ap.anti_pattern_id,
+                        "name":           ap.name,
+                        "severity":       ap.severity,
+                        "description":    ap.description,
+                        "recommendation": ap.recommendation,
+                    }
+                    for ap in a.anti_patterns
+                ],
             }
             for a in plan.pipelines
         ],
     }
     # ── Aggregate inventories ─────────────────────────────
-    out["all_inputs"]  = plan.all_inputs
-    out["all_outputs"] = plan.all_outputs
-    out["all_fields"]  = plan.all_fields
+    out["all_inputs"]          = plan.all_inputs
+    out["all_outputs"]         = plan.all_outputs
+    out["all_fields"]          = plan.all_fields
+    out["pattern_summary"]     = plan.pattern_summary
+    out["anti_pattern_summary"] = plan.anti_pattern_summary
 
     Path(path).write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
 
@@ -1388,30 +2572,36 @@ def write_csv(plan: MigrationPlan, path: str) -> None:
     """Write a flat CSV migration plan — one row per pipeline."""
     fieldnames = [
         "wave", "pipeline_id", "decision", "operational_benefit", "migration_effort",
-        "effort_score", "filter_transform_score", "full_replacement_score",
-        "is_pure_transformer", "is_orchestrator",
+        "effort_score", "is_pure_transformer", "is_orchestrator",
+        "primary_pattern", "pattern_tags", "portability", "coupling", "complexity",
+        "anti_pattern_count", "anti_pattern_ids", "anti_pattern_severities",
         "cluster_id", "cluster_template", "cluster_size",
         "hard_blockers", "workaround_blockers", "decision_blockers",
         "blocker_names", "wave_reason",
+        "external_deps", "dep_count",
+        "owner", "team", "customer", "environment", "criticality", "volume",
         "fields_created", "fields_renamed", "fields_removed",
         "grok_targets", "enriched_targets", "timestamp_source",
+        "arch_current_input", "arch_current_filters", "arch_target_input",
+        "arch_coverage_pct", "arch_manual_rewrites",
     ]
-    cluster_map = {a.pipeline_id: a.cluster_id for a in plan.pipelines}
     cluster_size_map = {c.cluster_id: c.size for c in plan.clusters}
-
-    # We need the original fts/frs — store from pipeline_id lookup
-    # (not stored on PipelineAdvice, so we just leave blank — the JSON has it)
 
     with open(path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=fieldnames)
         writer.writeheader()
         for a in plan.pipelines:
-            hard   = [b for b in a.blockers if b.severity == "hard"]
-            work   = [b for b in a.blockers if b.severity == "workaround"]
-            dec    = [b for b in a.blockers if b.severity == "decision"]
-            inv    = a.field_inventory
-            cid    = a.cluster_id or ""
-            csz    = cluster_size_map.get(cid, 1)
+            hard  = [b for b in a.blockers if b.severity == "hard"]
+            work  = [b for b in a.blockers if b.severity == "workaround"]
+            dec   = [b for b in a.blockers if b.severity == "decision"]
+            inv   = a.field_inventory
+            meta  = a.metadata
+            arch  = a.architecture
+            cur   = arch.get("current", {})
+            tgt   = arch.get("target",  {})
+            cid   = a.cluster_id or ""
+            csz   = cluster_size_map.get(cid, 1)
+            deps_str = " | ".join(f"{d.dep_type}:{d.path}" for d in a.external_deps[:6])
             writer.writerow({
                 "wave":               a.wave,
                 "pipeline_id":        a.pipeline_id,
@@ -1419,10 +2609,16 @@ def write_csv(plan: MigrationPlan, path: str) -> None:
                 "operational_benefit": a.operational_benefit,
                 "migration_effort":   a.migration_effort,
                 "effort_score":       a.effort_score,
-                "filter_transform_score": "",  # from source JSON
-                "full_replacement_score":  "",
                 "is_pure_transformer": a.is_pure_transformer,
                 "is_orchestrator":    a.is_orchestrator,
+                "primary_pattern":    a.pattern.primary     if a.pattern else "",
+                "pattern_tags":       " | ".join(a.pattern.tags or []) if a.pattern else "",
+                "portability":        a.pattern.portability  if a.pattern else "",
+                "coupling":           a.pattern.coupling     if a.pattern else "",
+                "complexity":         a.pattern.complexity   if a.pattern else "",
+                "anti_pattern_count": len(a.anti_patterns),
+                "anti_pattern_ids":   " | ".join(ap.anti_pattern_id for ap in a.anti_patterns),
+                "anti_pattern_severities": " | ".join(ap.severity for ap in a.anti_patterns),
                 "cluster_id":         cid,
                 "cluster_template":   a.cluster_template,
                 "cluster_size":       csz,
@@ -1431,12 +2627,25 @@ def write_csv(plan: MigrationPlan, path: str) -> None:
                 "decision_blockers":  len(dec),
                 "blocker_names":      " | ".join(b.name for b in a.blockers),
                 "wave_reason":        a.wave_reason,
+                "external_deps":      deps_str,
+                "dep_count":          len(a.external_deps),
+                "owner":              meta.owner,
+                "team":               meta.team,
+                "customer":           meta.customer,
+                "environment":        meta.environment,
+                "criticality":        meta.criticality,
+                "volume":             meta.volume,
                 "fields_created":     " | ".join(inv.created[:10]),
                 "fields_renamed":     " | ".join(f"{s}→{d}" for s,d in inv.renamed[:8]),
                 "fields_removed":     " | ".join(inv.removed[:10]),
                 "grok_targets":       " | ".join(inv.grok_targets[:10]),
                 "enriched_targets":   " | ".join(inv.enriched[:5]),
                 "timestamp_source":   inv.timestamp_source or "",
+                "arch_current_input":   ", ".join(cur.get("inputs", [])),
+                "arch_current_filters": ", ".join(cur.get("filters", [])),
+                "arch_target_input":    ", ".join(tgt.get("inputs", [])),
+                "arch_coverage_pct":    arch.get("coverage_pct", 0),
+                "arch_manual_rewrites": " | ".join(tgt.get("manual_rewrites", [])),
             })
 
 # ─────────────────────────────────────────────────────────────
@@ -1515,6 +2724,56 @@ def write_inventory_csv(plan: MigrationPlan, base_path: str) -> None:
     print(f"  Outputs CSV: {stem}_outputs.csv")
     print(f"  Fields CSV:  {stem}_fields.csv")
 
+    # ── pattern summary ────────────────────────────────────
+    if plan.pattern_summary:
+        with open(f"{stem}_patterns.csv", "w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=[
+                "pattern", "description", "pipeline_count", "pct_of_total",
+                "dominant_complexity", "avg_portability", "avg_coupling",
+                "avg_benefit", "avg_filter_coverage",
+                "wave1_count", "wave2_count", "wave3_count",
+                "top_plugins", "pipeline_ids",
+            ])
+            w.writeheader()
+            for r in plan.pattern_summary:
+                w.writerow({
+                    "pattern":             r["pattern"],
+                    "description":         r["description"],
+                    "pipeline_count":      r["pipeline_count"],
+                    "pct_of_total":        r["pct_of_total"],
+                    "dominant_complexity": r["dominant_complexity"],
+                    "avg_portability":     r["avg_portability"],
+                    "avg_coupling":        r["avg_coupling"],
+                    "avg_benefit":         r["avg_benefit"],
+                    "avg_filter_coverage": r["avg_filter_coverage"],
+                    "wave1_count":         r["wave1_count"],
+                    "wave2_count":         r["wave2_count"],
+                    "wave3_count":         r["wave3_count"],
+                    "top_plugins":         " | ".join(r.get("top_plugins", [])),
+                    "pipeline_ids":        " | ".join(r.get("pipeline_ids", [])),
+                })
+        print(f"  Patterns CSV: {stem}_patterns.csv")
+
+    # ── anti-pattern summary ───────────────────────────────
+    if plan.anti_pattern_summary:
+        with open(f"{stem}_anti_patterns.csv", "w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=[
+                "anti_pattern_id", "name", "severity", "pipeline_count",
+                "description", "recommendation", "pipeline_ids",
+            ])
+            w.writeheader()
+            for r in plan.anti_pattern_summary:
+                w.writerow({
+                    "anti_pattern_id": r["anti_pattern_id"],
+                    "name":            r["name"],
+                    "severity":        r["severity"],
+                    "pipeline_count":  r["pipeline_count"],
+                    "description":     r["description"],
+                    "recommendation":  r["recommendation"],
+                    "pipeline_ids":    " | ".join(r.get("pipeline_ids", [])),
+                })
+        print(f"  Anti-patterns CSV: {stem}_anti_patterns.csv")
+
 
 def main():
     ap = argparse.ArgumentParser(
@@ -1523,6 +2782,8 @@ def main():
                     help="JSON output from logstash_pipeline_analyzer_v12.py")
     ap.add_argument("--json-out",  help="Write full advisory plan to JSON file")
     ap.add_argument("--csv-out",   help="Write pipeline plan CSV; also writes _inputs/_outputs/_fields CSVs")
+    ap.add_argument("--metadata",  help="Optional YAML/JSON sidecar with pipeline business metadata "
+                                        "(owner, customer, criticality, etc.)")
     ap.add_argument("--wave", type=int, choices=[1,2,3],
                     help="Only show pipelines in this wave")
     ap.add_argument("--top-n", type=int, default=50,
@@ -1532,7 +2793,7 @@ def main():
     args = ap.parse_args()
 
     data = json.loads(Path(args.analysis_json).read_text(encoding="utf-8"))
-    plan = analyse(data)
+    plan = analyse(data, metadata_path=args.metadata)
 
     print_plan(plan, wave_filter=args.wave, top_n=args.top_n,
                use_color=not args.no_color)
