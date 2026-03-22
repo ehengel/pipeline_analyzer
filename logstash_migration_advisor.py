@@ -243,8 +243,10 @@ def _ls_field(f: str) -> str:
     parts = re.findall(r'\[([^\]]+)\]', f)
     return ".".join(parts) if parts else f.strip()
 
-def _extract_grok_captures(pattern: str) -> List[str]:
+def _extract_grok_captures(pattern) -> List[str]:
     """Pull named capture names from a grok pattern string."""
+    if not isinstance(pattern, str):
+        return []
     captures = []
     captures += re.findall(r'%\{[^:}]+:([^}]+)\}', pattern)
     captures += re.findall(r'\(\?<([^>]+)>', pattern)
@@ -290,11 +292,19 @@ def build_field_inventory(tree: Dict[str, Any]) -> FieldInventory:
             if isinstance(match, dict):
                 for v in match.values():
                     if isinstance(v, str): patterns.append(v)
-                    elif isinstance(v, list): patterns.extend(v)
+                    elif isinstance(v, list):
+                        for item in v:
+                            if isinstance(item, str): patterns.append(item)
             elif isinstance(match, list):
                 # alternating [field, pattern, field, pattern]
+                # values may themselves be lists of patterns
                 for i in range(1, len(match), 2):
-                    patterns.append(match[i])
+                    item = match[i]
+                    if isinstance(item, str):
+                        patterns.append(item)
+                    elif isinstance(item, list):
+                        for sub in item:
+                            if isinstance(sub, str): patterns.append(sub)
             for pat in patterns:
                 inv.grok_targets.extend(_extract_grok_captures(pat))
 
