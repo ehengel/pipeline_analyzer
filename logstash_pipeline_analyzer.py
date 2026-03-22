@@ -269,6 +269,8 @@ class ProcessorNode:
     ingest_status: str = "partial"
     ingest_processor: Optional[str] = None
     ingest_note: str = ""
+    # Dissect replacement analysis (grok nodes only; None for all other plugins)
+    dissect_analysis: Optional[Dict[str, Any]] = None
 
 @dataclass
 class ConditionalBranch:
@@ -295,7 +297,7 @@ class SequenceNode:
 def filter_tree_to_dict(node) -> Dict[str, Any]:
     """Recursively serialise the filter tree to plain dicts for JSON output."""
     if isinstance(node, ProcessorNode):
-        return {
+        d: Dict[str, Any] = {
             "node_type": "processor",
             "plugin": node.plugin,
             "seq_index": node.seq_index,
@@ -309,6 +311,9 @@ def filter_tree_to_dict(node) -> Dict[str, Any]:
             "ingest_processor": node.ingest_processor,
             "ingest_note": node.ingest_note,
         }
+        if node.dissect_analysis is not None:
+            d["dissect_analysis"] = node.dissect_analysis
+        return d
     if isinstance(node, ConditionalNode):
         return {
             "node_type": "conditional",
@@ -550,6 +555,290 @@ def extract_grok_metrics(block: Block) -> Dict[str, Any]:
         elif item.key.lower() == "overwrite":
             m["overwrite_count"] += len(array_of_scalars(item.value)) if isinstance(item.value, ArrayValue) else 1
     return m
+
+
+# ─────────────────────────────────────────────────────────────
+# Grok → Dissect replacement analysis
+# ─────────────────────────────────────────────────────────────
+
+# Named grok patterns that do format validation — dissect does NOT validate
+_GROK_VALIDATION_PATTERNS = {
+    "IP", "IPV4", "IPV6", "INT", "NUMBER", "POSINT", "NONNEGINT",
+    "BASE16NUM", "BASE16FLOAT", "FLOAT", "USERNAME", "USER",
+    "EMAIL", "MAC", "URI", "URIPATH", "URIPARAM", "URIPATHPARAM",
+    "LOGLEVEL", "UUID", "DATE", "TIME", "DATETIME",
+    "SYSLOGTIMESTAMP", "TIMESTAMP_ISO8601", "HTTPDATE",
+    "CISCOMAC", "WINDOWSMAC", "COMMONMAC", "HOSTNAME",
+}
+
+# Named grok patterns that are structural (no format constraint beyond the delimiter)
+_GROK_STRUCTURAL_PATTERNS = {
+    "WORD", "NOTSPACE", "SPACE", "GREEDYSPACE",
+    "DATA", "GREEDYDATA", "GREEDYMULTILINE", "MULTILINEDATA",
+    "QUOTEDSTRING",
+}
+
+_CAPTURE_RE = re.compile(r'%\{([^}]+)\}')
+_CHAR_CLASS_RE = re.compile(r'(?<!\\)\[.+?(?<!\\)\]')
+
+
+def _analyze_single_pattern(pattern: str) -> Dict[str, Any]:
+    """
+    Analyse one grok pattern string for dissect convertibility.
+
+    Returns a dict:
+      convertible : bool
+      confidence  : "high" | "medium" | "low" | None
+      dissect_pattern : str | None   — the equivalent dissect pattern
+      reason      : str              — why not convertible, or ""
+      caveats     : List[str]        — semantic differences to highlight
+      validation_lost : List[str]    — grok pattern names that validate format
+    """
+    caveats: List[str] = []
+    validation_lost: List[str] = []
+
+    # ── Rule 1: top-level alternation → not convertible ──────
+    # Strip %{...} tokens then check for remaining |
+    stripped_of_captures = _CAPTURE_RE.sub("CAPTURE", pattern)
+    if "|" in stripped_of_captures:
+        return {"convertible": False, "confidence": None, "dissect_pattern": None,
+                "reason": "Top-level alternation — pattern covers multiple log formats. "
+                          "Dissect requires a single fixed structure.",
+                "caveats": [], "validation_lost": []}
+
+    # ── Rule 2: character classes or unescaped parens/quantifiers ────
+    if _CHAR_CLASS_RE.search(pattern):
+        return {"convertible": False, "confidence": None, "dissect_pattern": None,
+                "reason": "Character class [...] in pattern — this is a regex construct, "
+                          "not a fixed literal delimiter.",
+                "caveats": [], "validation_lost": []}
+    # Check for unescaped parens or quantifiers in the literal parts
+    for literal_part in _CAPTURE_RE.split(pattern):
+        if literal_part.startswith("%{"):
+            continue   # it's a capture token from the split, skip
+        if re.search(r'(?<!\\)[()]', literal_part):
+            return {"convertible": False, "confidence": None, "dissect_pattern": None,
+                    "reason": "Parentheses in literal separator — likely regex grouping.",
+                    "caveats": [], "validation_lost": []}
+        if re.search(r'(?<!\\)[+*?]', literal_part):
+            return {"convertible": False, "confidence": None, "dissect_pattern": None,
+                    "reason": "Quantifier (+, *, ?) in literal — regex construct, not a fixed delimiter.",
+                    "caveats": [], "validation_lost": []}
+
+    # ── Rule 3: parse %{PATTERN:name} tokens ─────────────────
+    captures = []
+    for m in _CAPTURE_RE.finditer(pattern):
+        inner = m.group(1)
+        parts = inner.split(":")
+        pname = parts[0].upper()
+        fname = parts[1].strip() if len(parts) > 1 else None
+        ftype = parts[2] if len(parts) > 2 else None
+
+        if not fname:
+            return {"convertible": False, "confidence": None, "dissect_pattern": None,
+                    "reason": f"Unnamed %{{{pname}}} — no capture name, dissect needs field names.",
+                    "caveats": [], "validation_lost": []}
+
+        if pname in _GROK_VALIDATION_PATTERNS:
+            validation_lost.append(pname)
+        captures.append({"pattern": pname, "field": fname, "type": ftype})
+
+    if not captures:
+        return {"convertible": False, "confidence": None, "dissect_pattern": None,
+                "reason": "No named captures — nothing to map to dissect fields.",
+                "caveats": [], "validation_lost": []}
+
+    # ── Rule 4: GREEDYDATA not at final position ──────────────
+    for i, cap in enumerate(captures):
+        if cap["pattern"] == "GREEDYDATA" and i < len(captures) - 1:
+            return {"convertible": False, "confidence": None, "dissect_pattern": None,
+                    "reason": "GREEDYDATA in non-final position — dissect cannot greedily "
+                              "consume mid-pattern. Use DATA instead, or restructure.",
+                    "caveats": [], "validation_lost": []}
+
+    # ── Build the dissect pattern ─────────────────────────────
+    dissect_parts: List[str] = []
+    tokens = _CAPTURE_RE.split(pattern)
+    for tok in tokens:
+        if tok.startswith("%{") or not tok:
+            continue  # skip — handled by capture iteration
+        # Unescape \\[ \\] → [ ] (literal brackets in log format)
+        lit = tok.replace("\\[", "[").replace("\\]", "]")
+        dissect_parts.append(lit)
+
+    # Interleave captures and literals in order
+    dissect_tokens: List[str] = []
+    literal_idx = 0
+    # Re-split cleanly: alternating [literal, capture, literal, capture, ...]
+    full_split = _CAPTURE_RE.split(pattern)
+    cap_idx = 0
+    for i, tok in enumerate(full_split):
+        if i % 2 == 0:
+            # Literal part
+            lit = tok.replace("\\[", "[").replace("\\]", "]")
+            dissect_tokens.append(lit)
+        else:
+            # Capture: tok is the inner content of %{...}
+            parts = tok.split(":")
+            fname = parts[1].strip() if len(parts) > 1 else parts[0]
+            dissect_tokens.append(f"%{{{fname}}}")
+            cap_idx += 1
+
+    dissect_pattern = "".join(dissect_tokens)
+
+    # ── Assess confidence ─────────────────────────────────────
+    if validation_lost:
+        confidence = "medium"
+        lost_str = ", ".join(dict.fromkeys(validation_lost))  # deduplicated, ordered
+        caveats.append(
+            f"Grok validates format ({lost_str}) — dissect does NOT. "
+            "Use dissect only when input format is guaranteed consistent. "
+            "Remove tag_on_failure when switching."
+        )
+    else:
+        confidence = "high"
+
+    if len(captures) == 1 and not dissect_tokens[0] and not dissect_tokens[-1]:
+        caveats.append(
+            "Single-capture pattern extracts the entire field value. "
+            "Dissect works here but grok also validates the format — consider whether "
+            "validation matters for this field."
+        )
+        if confidence == "high":
+            confidence = "medium"
+
+    # Note on tag_on_failure
+    caveats.append(
+        "tag_on_failure from grok has no dissect equivalent. "
+        "Use ignore_failure: true or on_failure in the dissect processor."
+    )
+
+    return {
+        "convertible": True,
+        "confidence": confidence,
+        "dissect_pattern": dissect_pattern,
+        "reason": "",
+        "caveats": caveats,
+        "validation_lost": list(dict.fromkeys(validation_lost)),
+    }
+
+
+def analyze_grok_dissect_replacement(config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Analyse ALL match patterns in a grok processor config block and
+    return a summary of whether the entire grok can be replaced by dissect.
+
+    Returns:
+      overall_convertible : bool   — True only if ALL patterns are convertible
+      overall_confidence  : str    — "high" | "medium" | "low" | "not_convertible"
+      per_pattern         : List[dict]  — result per (source_field, pattern)
+      dissect_processors  : List[dict]  — ready-to-use dissect processor configs
+      summary             : str    — one-line human description
+      all_caveats         : List[str]
+      all_validation_lost : List[str]
+    """
+    match = config.get("match", {})
+    patterns_to_check: List[Tuple[str, str]] = []  # (source_field, pattern_string)
+
+    if isinstance(match, dict):
+        for src_field, val in match.items():
+            if isinstance(val, str):
+                patterns_to_check.append((src_field, val))
+            elif isinstance(val, list):
+                for p in val:
+                    if isinstance(p, str):
+                        patterns_to_check.append((src_field, p))
+    elif isinstance(match, list):
+        # Array form: [field, pattern, field, pattern, ...]
+        for i in range(0, len(match) - 1, 2):
+            patterns_to_check.append((str(match[i]), str(match[i+1])))
+
+    if not patterns_to_check:
+        return {
+            "overall_convertible": False,
+            "overall_confidence": "not_convertible",
+            "per_pattern": [],
+            "dissect_processors": [],
+            "summary": "No match patterns found in grok config.",
+            "all_caveats": [],
+            "all_validation_lost": [],
+        }
+
+    per_pattern: List[Dict[str, Any]] = []
+    dissect_processors: List[Dict[str, Any]] = []
+    all_convertible = True
+    confidence_scores = {"high": 2, "medium": 1, "low": 0}
+    min_confidence = "high"
+    all_caveats: List[str] = []
+    all_validation_lost: List[str] = []
+
+    for src_field, pat in patterns_to_check:
+        result = _analyze_single_pattern(pat)
+        per_pattern.append({
+            "source_field": src_field,
+            "grok_pattern": pat,
+            **result,
+        })
+        if not result["convertible"]:
+            all_convertible = False
+        else:
+            c = result["confidence"]
+            if confidence_scores.get(c, 0) < confidence_scores.get(min_confidence, 2):
+                min_confidence = c
+            dp = result["dissect_pattern"]
+            if dp:
+                dissect_processors.append({
+                    "dissect": {
+                        "field": src_field,
+                        "pattern": dp,
+                        "ignore_failure": True,
+                    }
+                })
+            for caveat in result["caveats"]:
+                if caveat not in all_caveats:
+                    all_caveats.append(caveat)
+            for v in result["validation_lost"]:
+                if v not in all_validation_lost:
+                    all_validation_lost.append(v)
+
+    # Multiple match patterns in one grok = try-each-until-success semantics.
+    # Dissect has no equivalent fallback — needs separate processors with on_failure chaining.
+    if len(patterns_to_check) > 1 and all_convertible:
+        all_caveats.insert(0,
+            f"This grok has {len(patterns_to_check)} match patterns (try-each-until-success). "
+            "Dissect has no automatic fallback. You need to chain dissect processors "
+            "using on_failure, or keep grok for multi-pattern matching."
+        )
+        min_confidence = "medium"
+
+    if all_convertible:
+        conf_label = min_confidence
+        if len(patterns_to_check) == 1 and min_confidence == "high":
+            summary = (f"✓ Can replace with dissect [{min_confidence} confidence] — "
+                       f"pattern: {dissect_processors[0]['dissect']['pattern']}")
+        elif len(patterns_to_check) == 1:
+            summary = (f"✓ Can replace with dissect [{min_confidence} confidence] — "
+                       f"loses format validation for: {', '.join(all_validation_lost)}")
+        else:
+            summary = (f"⚠ Structurally convertible but needs on_failure chaining "
+                       f"({len(patterns_to_check)} patterns) [{min_confidence} confidence]")
+    else:
+        conf_label = "not_convertible"
+        not_ok = [p for p in per_pattern if not p["convertible"]]
+        reasons = list(dict.fromkeys(p["reason"] for p in not_ok))
+        summary = f"✗ Cannot replace with dissect — {reasons[0]}"
+        if len(reasons) > 1:
+            summary += f" (and {len(reasons)-1} more reason(s))"
+
+    return {
+        "overall_convertible": all_convertible,
+        "overall_confidence": conf_label,
+        "per_pattern": per_pattern,
+        "dissect_processors": dissect_processors,
+        "summary": summary,
+        "all_caveats": all_caveats,
+        "all_validation_lost": all_validation_lost,
+    }
 
 def extract_mutate_metrics(block: Block) -> Dict[str, Any]:
     m = {"rename_count":0,"convert_count":0,"add_field_count":0,"remove_field_count":0,"remove_tag_count":0,"replace_count":0,"add_tag_count":0}
@@ -809,7 +1098,7 @@ def collect_filter_tree(ast: Block, raw_source: str = "", include_custom: bool =
     Build an ordered SequenceNode tree from the filter { } section.
     Preserves execution order and branch structure.
     raw_source: the original file text (with comments stripped) used to
-    extract raw_config snippets for each plugin block.
+    extract raw_config snippets for each plugin block and condition expressions.
     """
     seq_counter = [0]
 
@@ -823,34 +1112,6 @@ def collect_filter_tree(ast: Block, raw_source: str = "", include_custom: bool =
         if n in OFFICIAL_FILTER_PLUGINS: return True
         if include_custom: return direct_assignment_count(node) > 0
         return False
-
-    def extract_raw(plugin_name: str, seq_idx: int) -> str:
-        """Heuristically find the Nth occurrence of plugin_name { in raw_source."""
-        # Count occurrences seen so far for this plugin
-        occurrences = []
-        pattern = re.compile(rf'(?i)\b{re.escape(plugin_name)}\s*\{{')
-        for m in pattern.finditer(raw_source):
-            brace = raw_source.find("{", m.start())
-            if brace == -1: continue
-            depth=0; in_str=False; quote=""; esc=False; end=None
-            for k in range(brace, len(raw_source)):
-                ch=raw_source[k]
-                if esc: esc=False; continue
-                if ch=="\\": esc=True; continue
-                if in_str:
-                    if ch==quote: in_str=False; quote=""
-                    continue
-                if ch in ("'",'"'): in_str=True; quote=ch; continue
-                if ch=="{": depth+=1
-                elif ch=="}":
-                    depth-=1
-                    if depth==0: end=k+1; break
-            if end: occurrences.append(raw_source[m.start():end].strip())
-        # Return the occurrence that corresponds to the counter for this plugin
-        # (we track separately per-plugin in a dict)
-        if not occurrences: return ""
-        # Use the first available — caller tracks which instance this is
-        return occurrences[0] if occurrences else ""
 
     # Per-plugin occurrence counter for raw extraction
     plugin_occurrence: Dict[str, int] = defaultdict(int)
@@ -880,6 +1141,61 @@ def collect_filter_tree(ast: Block, raw_source: str = "", include_custom: bool =
         plugin_occurrence[plugin_name] += 1
         return occurrences[n] if n < len(occurrences) else ""
 
+    # ── Condition expression extraction ───────────────────────────────────────
+    # Scan raw_source for all if/elsif condition expressions in source order.
+    # Each entry is the verbatim condition text between the keyword and its '{'.
+    # We track a global index and hand them out in the order walk_sequence visits
+    # branches — which matches document order.
+
+    _COND_KW_RE = re.compile(
+        r'\b(else\s+if|elsif|if)\s+'    # keyword
+        r'((?:[^{\'\"\\]|\'[^\']*\'|"[^"]*"|\\.)*?)'  # condition (non-greedy)
+        r'\s*\{',                         # opening brace
+        re.DOTALL
+    )
+    _cond_exprs: List[Tuple[str, str]] = []  # [(keyword, expr), ...]
+    for m in _COND_KW_RE.finditer(raw_source):
+        kw   = m.group(1).lower().replace(" ", " ")  # normalise "else if"
+        expr = m.group(2).strip()
+        _cond_exprs.append((kw, expr))
+
+    _cond_cursor = [0]   # index into _cond_exprs
+
+    def next_condition(expected_kw: str) -> str:
+        """
+        Return the next condition expression whose keyword matches expected_kw.
+        Falls back to a placeholder if the cursor runs out or keywords diverge.
+        """
+        idx = _cond_cursor[0]
+        # Scan forward a short distance to handle any mis-alignment
+        for lookahead in range(idx, min(idx + 4, len(_cond_exprs))):
+            kw, expr = _cond_exprs[lookahead]
+            norm_kw   = kw.strip().replace("else if", "elsif")
+            norm_exp  = expected_kw.strip().replace("else if", "elsif")
+            if norm_kw == norm_exp:
+                _cond_cursor[0] = lookahead + 1
+                return expr
+        _cond_cursor[0] = idx + 1   # advance anyway to avoid stalling
+        return f"{expected_kw} (...)"
+
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _is_implicit_conditional_body(node: Block) -> bool:
+        """
+        Detect blocks that are actually if/elsif branch bodies mangled by the tokenizer.
+        The parser sees 'if [x] == "syslog" {' and names the block "syslog" because
+        key_buf flushes on LBRACE — the last token of the condition expression wins.
+        These blocks: are not structural, not a plugin, but contain plugin children.
+        """
+        n = node.name.lower()
+        if n in STRUCTURAL_BLOCKS: return False
+        if n in OFFICIAL_FILTER_PLUGINS: return False
+        # Contains plugin children → it's a conditional branch body
+        return any(isinstance(x, Block) and
+                   (x.name.lower() in OFFICIAL_FILTER_PLUGINS or
+                    x.name.lower() in STRUCTURAL_BLOCKS)
+                   for x in node.items)
+
     def walk_sequence(node: Block, inside_filter: bool, depth: int, cond_path: List[str]) -> SequenceNode:
         seq = SequenceNode()
         name = node.name.lower()
@@ -897,62 +1213,103 @@ def collect_filter_tree(ast: Block, raw_source: str = "", include_custom: bool =
             item = children[i]
             if isinstance(item, Block):
                 cname = item.name.lower()
+
+                # ── Explicit 'if' block (tokenizer preserved the keyword) ──
                 if cname == "if":
-                    # Collect the full if/elsif/else chain
                     cond_node = ConditionalNode(seq_index=next_seq(), branch_depth=depth)
-                    # Get the condition string from subsequent WORD tokens before LBRACE
-                    # (already embedded in the block name via the tokenizer for "if")
-                    # We use the block name as a proxy — the tokenizer captures "if" but
-                    # not the condition expression. Extract it from raw source heuristically.
-                    branch_body = walk_sequence(item, True, depth+1, cond_path + [f"if (branch)"])
+                    if_expr = next_condition("if")
+                    branch_body = walk_sequence(item, True, depth+1,
+                                               cond_path + [f"if {if_expr}"])
                     cond_node.branches.append(ConditionalBranch(
-                        condition="if (condition)",
-                        branch_type="if",
-                        body=branch_body,
-                    ))
-                    # Look ahead for elsif/else
+                        condition=if_expr, branch_type="if", body=branch_body))
                     j = i + 1
                     while j < len(children):
                         sibling = children[j]
-                        if isinstance(sibling, Block) and sibling.name.lower() in ("elsif", "else if"):
-                            sib_body = walk_sequence(sibling, True, depth+1, cond_path + ["elsif (branch)"])
+                        sname = sibling.name.lower() if isinstance(sibling, Block) else ""
+                        if isinstance(sibling, Block) and sname in ("elsif", "else if"):
+                            elsif_expr = next_condition("elsif")
+                            sib_body = walk_sequence(sibling, True, depth+1,
+                                                     cond_path + [f"elsif {elsif_expr}"])
                             cond_node.branches.append(ConditionalBranch(
-                                condition="elsif (condition)",
-                                branch_type="elsif",
-                                body=sib_body,
-                            ))
+                                condition=elsif_expr, branch_type="elsif", body=sib_body))
                             j += 1
-                        elif isinstance(sibling, Block) and sibling.name.lower() == "else":
-                            else_body = walk_sequence(sibling, True, depth+1, cond_path + ["else"])
+                        elif isinstance(sibling, Block) and sname == "else":
+                            else_body = walk_sequence(sibling, True, depth+1,
+                                                      cond_path + ["else"])
                             cond_node.branches.append(ConditionalBranch(
-                                condition="",
-                                branch_type="else",
-                                body=else_body,
-                            ))
+                                condition="", branch_type="else", body=else_body))
+                            j += 1; break
+                        elif isinstance(sibling, Block) and _is_implicit_conditional_body(sibling):
+                            # Another mangled elsif — consume it
+                            elsif_expr = next_condition("elsif")
+                            sib_body = walk_sequence(sibling, True, depth+1,
+                                                     cond_path + [f"elsif {elsif_expr}"])
+                            cond_node.branches.append(ConditionalBranch(
+                                condition=elsif_expr, branch_type="elsif", body=sib_body))
                             j += 1
-                            break
                         else:
                             break
                     seq.children.append(cond_node)
                     i = j
                     continue
+
+                # ── Implicit conditional body (tokenizer mangled condition→block name) ──
+                # e.g. 'if [type] == "syslog" {' → Block("syslog")
+                elif _is_implicit_conditional_body(item):
+                    cond_node = ConditionalNode(seq_index=next_seq(), branch_depth=depth)
+                    if_expr = next_condition("if")
+                    branch_body = walk_sequence(item, True, depth+1,
+                                               cond_path + [f"if {if_expr}"])
+                    cond_node.branches.append(ConditionalBranch(
+                        condition=if_expr, branch_type="if", body=branch_body))
+                    # Look ahead for elsif (another mangled block) or else
+                    j = i + 1
+                    while j < len(children):
+                        sibling = children[j]
+                        sname = sibling.name.lower() if isinstance(sibling, Block) else ""
+                        if isinstance(sibling, Block) and sname == "else":
+                            else_body = walk_sequence(sibling, True, depth+1,
+                                                      cond_path + ["else"])
+                            cond_node.branches.append(ConditionalBranch(
+                                condition="", branch_type="else", body=else_body))
+                            j += 1; break
+                        elif isinstance(sibling, Block) and _is_implicit_conditional_body(sibling):
+                            elsif_expr = next_condition("elsif")
+                            sib_body = walk_sequence(sibling, True, depth+1,
+                                                     cond_path + [f"elsif {elsif_expr}"])
+                            cond_node.branches.append(ConditionalBranch(
+                                condition=elsif_expr, branch_type="elsif", body=sib_body))
+                            j += 1
+                        else:
+                            break
+                    seq.children.append(cond_node)
+                    i = j
+                    continue
+
                 elif cname in ("elsif", "else if", "else"):
                     # Already consumed by the if-lookahead above; skip
                     i += 1; continue
                 elif is_plugin(item):
                     ii = get_ingest_info(cname)
+                    cfg = block_to_config(item)
+                    # For grok processors, analyse whether dissect could replace them
+                    dissect_result = (
+                        analyze_grok_dissect_replacement(cfg)
+                        if cname == "grok" else None
+                    )
                     pn = ProcessorNode(
                         plugin=cname,
                         seq_index=next_seq(),
                         branch_depth=depth,
                         condition_path=list(cond_path),
-                        config=block_to_config(item),
+                        config=cfg,
                         raw_config=get_raw_for_plugin(cname),
                         direct_assignments=direct_assignment_count(item),
                         metrics=processor_metrics(cname, item),
                         ingest_status=ii.status,
                         ingest_processor=ii.ingest_processor,
                         ingest_note=ii.note,
+                        dissect_analysis=dissect_result,
                     )
                     seq.children.append(pn)
                 else:
@@ -1529,6 +1886,53 @@ def main():
         n=status_counts.get(status,0)
         pct=f"{100*n//total_procs}%" if total_procs else "0%"
         print(f"  {status:<12}: {n:4d} ({pct})")
+
+    # ── Grok → Dissect opportunities ─────────────────────
+    grok_total = 0; dissect_ok = 0; dissect_medium = 0; dissect_no = 0
+    dissect_candidates: List[Tuple[str, str, str]] = []  # (pipeline, pattern, dissect_pattern)
+
+    def _collect_dissect(node_dict: Dict, pid: str):
+        nonlocal grok_total, dissect_ok, dissect_medium, dissect_no
+        nt = node_dict.get("node_type","")
+        if nt == "processor" and node_dict.get("plugin") == "grok":
+            grok_total += 1
+            da = node_dict.get("dissect_analysis")
+            if da:
+                if da.get("overall_convertible"):
+                    conf = da.get("overall_confidence","")
+                    if conf == "high":
+                        dissect_ok += 1
+                        for pp in da.get("per_pattern",[]):
+                            if pp.get("convertible") and pp.get("dissect_pattern"):
+                                dissect_candidates.append((pid, pp["grok_pattern"][:50], pp["dissect_pattern"][:50]))
+                    else:
+                        dissect_medium += 1
+                        for pp in da.get("per_pattern",[]):
+                            if pp.get("convertible") and pp.get("dissect_pattern"):
+                                dissect_candidates.append((pid, pp["grok_pattern"][:50], pp["dissect_pattern"][:50]))
+                else:
+                    dissect_no += 1
+        elif nt == "sequence":
+            for c in node_dict.get("children",[]): _collect_dissect(c, pid)
+        elif nt == "conditional":
+            for b in node_dict.get("branches",[]): _collect_dissect(b.get("body",{}), pid)
+
+    for row in logical_rows:
+        _collect_dissect(row.get("processors_ordered",{}), row["pipeline"])
+
+    if grok_total > 0:
+        print(f"\n=== GROK → DISSECT OPPORTUNITIES ===")
+        print(f"  Total grok processors scanned : {grok_total}")
+        print(f"  Replace with dissect (high)   : {dissect_ok}  — fixed delimiter, no validation loss concern")
+        print(f"  Replace with dissect (medium) : {dissect_medium}  — loses format validation, test first")
+        print(f"  Not replaceable               : {dissect_no}  — alternation, mid-GREEDYDATA, or regex literals")
+        if dissect_candidates:
+            print(f"\n  Sample conversions (grok → dissect):")
+            for pid, gpat, dpat in dissect_candidates[:8]:
+                print(f"  [{pid[:28]}]")
+                print(f"    grok:    {gpat}")
+                print(f"    dissect: {dpat}")
+                print()
 
     if warnings:
         print("\n=== WARNINGS ===",file=sys.stderr)
